@@ -1,0 +1,89 @@
+name: 'Pomelo Deploy'
+description: 'Upload an OCI image tarball to client-driver and trigger a deploy'
+author: 'Pomelo Productions'
+branding:
+  icon: 'upload-cloud'
+  color: 'orange'
+
+inputs:
+  url:
+    description: 'Base URL of the client-driver controller (e.g. https://controller.driver.pomelo.io)'
+    required: true
+  token:
+    description: 'Deploy token (Bearer secret) scoped to the service (preferred) or org/app being deployed'
+    required: true
+  service:
+    description: 'Service id (numeric) to deploy. Preferred — resolves the exact K8s target from the org-owned Service record. Supersedes org/app.'
+    required: false
+    default: ''
+  org:
+    description: '(deprecated) Tenant org slug (e.g. equity-creative). Only used when service is not set.'
+    required: false
+    default: ''
+  app:
+    description: '(deprecated) App slug within the org (e.g. cnh-merchandising). Only used when service is not set.'
+    required: false
+    default: ''
+  image:
+    description: 'Path to a gzipped OCI image tarball (e.g. ./image.tar.gz)'
+    required: true
+  env-file:
+    description: 'Optional path to a .env file whose contents become the deploy env Secret'
+    required: false
+    default: ''
+  wait:
+    description: 'Wait for deploy to finish (true) or return immediately after upload (false). Default: true'
+    required: false
+    default: 'true'
+  install-ref:
+    description: 'Git ref of PomeloProductions/deploy to install the CLI from. Pin this to a tag in production workflows.'
+    required: false
+    default: 'v1'
+
+outputs:
+  deploy_id:
+    description: 'The deploy id returned by the controller'
+    value: ${{ steps.deploy.outputs.deploy_id }}
+  image_ref:
+    description: 'The image ref pushed to the controller'
+    value: ${{ steps.deploy.outputs.image_ref }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Pomelo CLI
+      shell: bash
+      env:
+        POMELO_INSTALL_REF: ${{ inputs.install-ref }}
+      run: |
+        curl -fsSL "https://raw.githubusercontent.com/PomeloProductions/deploy/${POMELO_INSTALL_REF}/install.sh" \
+          | bash -s -- --ref "${POMELO_INSTALL_REF}" --force
+
+    - name: Deploy
+      id: deploy
+      shell: bash
+      env:
+        POMELO_URL: ${{ inputs.url }}
+        POMELO_TOKEN: ${{ inputs.token }}
+        POMELO_SERVICE: ${{ inputs.service }}
+        POMELO_ORG: ${{ inputs.org }}
+        POMELO_APP: ${{ inputs.app }}
+        POMELO_IMAGE: ${{ inputs.image }}
+        POMELO_ENV_FILE: ${{ inputs.env-file }}
+        POMELO_WAIT: ${{ inputs.wait }}
+      run: |
+        set -euo pipefail
+        flags=( --url "$POMELO_URL" --token "$POMELO_TOKEN" --image "$POMELO_IMAGE" )
+        # Prefer service-id targeting; fall back to the deprecated org/app slug pair.
+        if [[ -n "$POMELO_SERVICE" ]]; then
+          flags+=( --service "$POMELO_SERVICE" )
+        else
+          flags+=( --org "$POMELO_ORG" --app "$POMELO_APP" )
+        fi
+        if [[ -n "$POMELO_ENV_FILE" ]]; then
+          flags+=( --env-file "$POMELO_ENV_FILE" )
+        fi
+        if [[ "$POMELO_WAIT" == "false" ]]; then
+          flags+=( --no-wait )
+        fi
+        pomelo deploy "${flags[@]}"

@@ -1,0 +1,38 @@
+# .github/workflows/deploy.yml
+#
+# Minimal GitHub Actions workflow that builds your app image and ships it to
+# Pomelo's client-driver controller. Pin the action to a release tag (e.g. @v1)
+# in real workflows; @main is fine while you're iterating.
+#
+# Required repository secrets:
+#   POMELO_URL    — e.g. https://controller.driver.pomelo.io
+#   POMELO_TOKEN  — a deploy token (starts with pkd_), scoped to ORG/APP
+
+name: Deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t my-app:${{ github.sha }} .
+
+      - name: Save image to gzipped tarball
+        run: docker save my-app:${{ github.sha }} | gzip > image.tar.gz
+
+      - name: Deploy to Pomelo
+        uses: PomeloProductions/deploy@v1
+        with:
+          url:   ${{ secrets.POMELO_URL }}
+          token: ${{ secrets.POMELO_TOKEN }}
+          org:   your-org-slug
+          app:   your-app-slug
+          image: ./image.tar.gz
+          # env-file: ./deploy.env   # uncomment to ship env vars
+          # wait: 'false'             # uncomment to fire-and-forget

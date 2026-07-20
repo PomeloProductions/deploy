@@ -1,0 +1,48 @@
+# .gitlab-ci.yml
+#
+# Minimal GitLab CI pipeline that builds your image and ships it to Pomelo's
+# client-driver controller.
+#
+# Required CI/CD variables (Settings → CI/CD → Variables, masked + protected):
+#   POMELO_URL    — e.g. https://controller.driver.pomelo.io
+#   POMELO_TOKEN  — a deploy token (starts with pkd_)
+
+stages:
+  - build
+  - deploy
+
+variables:
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+  POMELO_ORG: your-org-slug
+  POMELO_APP: your-app-slug
+
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  script:
+    - docker build -t my-app:$IMAGE_TAG .
+    - docker save my-app:$IMAGE_TAG | gzip > image.tar.gz
+  artifacts:
+    paths:
+      - image.tar.gz
+    expire_in: 1 day
+
+deploy:
+  stage: deploy
+  image: alpine:3.20
+  needs: [build]
+  before_script:
+    - apk add --no-cache bash curl jq
+    - curl -fsSL https://raw.githubusercontent.com/PomeloProductions/deploy/v1/install.sh | bash
+  script:
+    - >
+      pomelo deploy
+      --url   "$POMELO_URL"
+      --token "$POMELO_TOKEN"
+      --org   "$POMELO_ORG"
+      --app   "$POMELO_APP"
+      --image ./image.tar.gz
+  only:
+    - main

@@ -1,0 +1,46 @@
+# .circleci/config.yml
+#
+# Minimal CircleCI pipeline that builds your image and ships it to Pomelo's
+# client-driver controller.
+#
+# Required project environment variables (Project Settings → Environment Variables):
+#   POMELO_URL    — e.g. https://controller.driver.pomelo.io
+#   POMELO_TOKEN  — a deploy token (starts with pkd_)
+
+version: 2.1
+
+jobs:
+  build-and-deploy:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 24.0.9
+      - run:
+          name: Build image
+          command: |
+            docker build -t my-app:${CIRCLE_SHA1} .
+            docker save my-app:${CIRCLE_SHA1} | gzip > image.tar.gz
+      - run:
+          name: Install Pomelo CLI
+          command: |
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends jq
+            curl -fsSL https://raw.githubusercontent.com/PomeloProductions/deploy/v1/install.sh | bash
+      - run:
+          name: Deploy to Pomelo
+          command: |
+            pomelo deploy \
+              --url   "$POMELO_URL" \
+              --token "$POMELO_TOKEN" \
+              --org   your-org-slug \
+              --app   your-app-slug \
+              --image ./image.tar.gz
+
+workflows:
+  deploy:
+    jobs:
+      - build-and-deploy:
+          filters:
+            branches:
+              only: main

@@ -1,0 +1,317 @@
+# Pomelo Deploy
+
+Tenant-facing deploy tooling for the Pomelo client-driver controller. This is
+how an org's CI (or a developer's laptop) hands an OCI image off to the
+platform and watches it roll out.
+
+## What this is
+
+`apps/deploy/` ships three things that tenants will consume from the outside:
+
+- a thin **bash CLI** (`pomelo deploy …`) that POSTs a gzipped image tarball
+  to the controller, kicks off a deploy, and streams logs back;
+- a **composite GitHub Action** (`PomeloProductions/deploy@v1`)
+  that wraps the CLI in two YAML steps so a tenant workflow is ~6 lines;
+- a small **installer** (`install.sh`) for non-GitHub CIs and laptops.
+
+Everything is a thin wrapper over the controller's HTTP API. There is no
+controller embedded in the CLI — it just takes a tarball and a token and talks
+to whatever URL you point it at. The same binary works against staging and
+production controllers; the URL changes, the rest doesn't.
+
+> **v1 implementation note.** The CLI is currently bash, because that's the
+> fastest path to a working surface that we can test against the real
+> controller. A Go binary is on the roadmap; when it ships, the CLI flags,
+> exit codes, and the `install.sh` URL all stay the same — only the bytes
+> behind the curl change.
+
+## Getting started
+
+1. **Mint a deploy token.** Sign in to your org's dashboard on the controller
+   (`https://controller.driver.pomelo.io`, or the URL your Pomelo contact gave
+   you), open **Apps → \<your app\> → Deploy tokens**, and create one. Tokens
+   start with `pkd_`. Treat them like passwords; if one leaks, revoke it from
+   the same screen.
+2. **Get your org + app slugs.** Same dashboard, top of the app page. Both are
+   lowercase, dash-separated (`equity-creative`, `cnh-merchandising`).
+3. **Pick your integration.** GitHub Actions tenants use the composite Action
+   below. Everyone else installs the CLI and calls it from their CI step.
+
+## GitHub Actions usage
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t my-app:${{ github.sha }} .
+
+      - name: Save to tarball
+        run: docker save my-app:${{ github.sha }} | gzip > image.tar.gz
+
+      - name: Deploy to Pomelo
+        uses: PomeloProductions/deploy@main
+        with:
+          url:     ${{ secrets.POMELO_URL }}
+          token:   ${{ secrets.POMELO_TOKEN }}
+          service: 42            # numeric Service id (preferred)
+          image:   ./image.tar.gz
+```
+
+Pin to a release tag (`@v1`) in production instead of `@main`.
+
+### Deploy targets: `service` (preferred) vs `org`/`app` (deprecated)
+
+There are two ways to address what you're deploying:
+
+- **`service` (preferred).** A numeric id of an org-owned **Service** record.
+  The Service carries its own Kubernetes deploy target (namespace, deployment,
+  container, env secret) and image repository, so this works for *any* app —
+  including ones that don't follow the `namespace == app-slug` /
+  `{slug}-api` / container `api` naming convention (e.g. a FastAPI service in
+  `org-3-lingwave` with deployment `lingwave-api-fastapi` / container
+  `fastapi`). The deploy token must be scoped to that service's org (and, for
+  a service-scoped token, that service).
+
+- **`org` + `app` (deprecated).** The original slug-based path. The controller
+  derives the target from the slug: namespace `{app}`, deployment `{app}-api`,
+  container `api`, secret `{app}-env`. Kept working for existing apps that
+  already follow that convention. Prefer `service` for anything new.
+
+Set `service` **or** the `org`+`app` pair — if `service` is present it wins.
+
+A complete copy lives in [`templates/github-actions.yml`](templates/github-actions.yml).
+
+## GitLab CI usage
+
+```yaml
+stages: [build, deploy]
+
+build:
+  stage: build
+  image: docker:24
+  services: [docker:24-dind]
+  script:
+    - docker build -t my-app:$CI_COMMIT_SHORT_SHA .
+    - docker save my-app:$CI_COMMIT_SHORT_SHA | gzip > image.tar.gz
+  artifacts:
+    paths: [image.tar.gz]
+
+deploy:
+  stage: deploy
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache bash curl jq
+    - curl -fsSL https://raw.githubusercontent.com/PomeloProductions/deploy/v1/install.sh | bash
+  script:
+    - >
+      pomelo deploy
+      --url   "$POMELO_URL"
+      --token "$POMELO_TOKEN"
+      --org   equity-creative
+      --app   cnh-merchandising
+      --image ./image.tar.gz
+```
+
+Full template: [`templates/gitlab-ci.yml`](templates/gitlab-ci.yml).
+
+## CircleCI usage
+
+```yaml
+version: 2.1
+
+jobs:
+  build-and-deploy:
+    docker: [{image: cimg/base:current}]
+    steps:
+      - checkout
+      - setup_remote_docker: {version: 24.0.9}
+      - run: docker build -t my-app:${CIRCLE_SHA1} . && docker save my-app:${CIRCLE_SHA1} | gzip > image.tar.gz
+      - run:
+          name: Install Pomelo CLI
+          command: |
+            sudo apt-get update && sudo apt-get install -y jq
+            curl -fsSL https://raw.githubusercontent.com/PomeloProductions/deploy/v1/install.sh | bash
+      - run:
+          name: Deploy
+          command: |
+            pomelo deploy --url "$POMELO_URL" --token "$POMELO_TOKEN" \
+                          --org equity-creative --app cnh-merchandising \
+                          --image ./image.tar.gz
+
+workflows:
+  deploy: { jobs: [build-and-deploy] }
+```
+
+Full template: [`templates/circleci-config.yml`](templates/circleci-config.yml).
+
+## Jenkins usage
+
+```groovy
+stage('Deploy to Pomelo') {
+    environment {
+        POMELO_URL   = credentials('pomelo-url')
+        POMELO_TOKEN = credentials('pomelo-token')
+    }
+    steps {
+        sh '''
+            docker save my-app:${GIT_COMMIT} | gzip > image.tar.gz
+            curl -fsSL https://raw.githubusercontent.com/PomeloProductions/deploy/v1/install.sh \
+              | bash -s -- --to "$WORKSPACE/.pomelo-bin"
+            "$WORKSPACE/.pomelo-bin/pomelo" deploy \
+              --url "$POMELO_URL" --token "$POMELO_TOKEN" \
+              --org equity-creative --app cnh-merchandising \
+              --image ./image.tar.gz
+        '''
+    }
+}
+```
+
+Full snippet: [`templates/jenkinsfile-snippet`](templates/jenkinsfile-snippet).
+
+## Local laptop usage
+
+Useful for one-off deploys, hotfixes, or testing the platform end-to-end
+without going through CI.
+
+```bash
+# 1. Install the CLI once
+curl -fsSL https://raw.githubusercontent.com/PomeloProductions/deploy/v1/install.sh | bash
+
+# 2. Build & save your image
+docker build -t my-app:dev .
+docker save my-app:dev | gzip > image.tar.gz
+
+# 3. Deploy
+export POMELO_URL=https://controller.driver.pomelo.io
+export POMELO_TOKEN=pkd_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+pomelo deploy \
+  --org   equity-creative \
+  --app   cnh-merchandising \
+  --image ./image.tar.gz
+```
+
+Pass `--env-file ./deploy.env` to ship environment variables alongside the
+image (they become the app's runtime Secret). Pass `--no-wait` to return
+as soon as the deploy starts instead of streaming logs to completion.
+
+## API reference
+
+The CLI is a wrapper over three HTTP endpoints. If you want to call them
+directly — debugging, alternative tooling, etc. — here's the contract.
+
+Each endpoint has a **service-id** form (preferred) and a **legacy org/app**
+form. They are equivalent except the service form resolves the K8s target from
+the Service record; pick whichever matches how the token was minted.
+
+### 1. Upload an image
+
+```
+# preferred:
+POST /v1/services/{service}/images
+# deprecated:
+POST /v1/organizations/{organization}/apps/{app}/images
+
+  Authorization: Bearer pkd_…
+  Content-Type:     application/octet-stream
+  Content-Encoding: gzip
+  body: gzipped OCI image tarball
+
+→ 201 Created
+  { "image_ref": "ghcr.io/pomeloproductions/<repo>:sha-<digest>",
+    "digest":    "sha256:…" }
+```
+
+The service form pushes to the Service's configured `image_repository` (or, if
+unset, the global `<base>/<slug>` convention).
+
+```bash
+curl --fail -X POST \
+  -H "Authorization: Bearer $POMELO_TOKEN" \
+  -H "Content-Type: application/octet-stream" \
+  -H "Content-Encoding: gzip" \
+  --data-binary @image.tar.gz \
+  "$POMELO_URL/v1/services/42/images"
+```
+
+### 2. Create a deploy
+
+```
+# preferred:
+POST /v1/services/{service}/deploys
+# deprecated:
+POST /v1/organizations/{organization}/apps/{app}/deploys
+
+  Authorization: Bearer pkd_…
+  Content-Type: application/json
+  body: { "image_ref": "…", "env": { "FOO": "bar" } }   # env is optional
+
+→ 202 Accepted
+  { "deploy_id": "dep_01H…", "status": "pending",
+    "logs_url": "/v1/deploys/dep_01H…/logs" }
+```
+
+### 3. Stream deploy logs
+
+```
+GET /v1/deploys/{deploy_id}/logs
+  Authorization: Bearer pkd_…
+  Accept: text/event-stream
+
+→ SSE stream of events:
+  data: {"event_type":"build.started","message":"…","metadata":{},"created_at":"…"}
+  data: {"event_type":"deploy.ready",  "message":"…","metadata":{},"created_at":"…"}
+```
+
+The stream terminates on either `deploy.ready` (success) or `deploy.failed`
+(failure). The CLI exits 0 / 1 to match.
+
+> The exact request/response shapes will be locked when the controller API
+> (Tracks A/B) merges. If something diverges, this README and
+> `cli/pomelo-deploy.sh` are the single source of truth — the contract is
+> defined in one place in the CLI and is straightforward to update.
+
+## Troubleshooting
+
+**`401 Unauthorized` on upload.**  Token is missing, revoked, or scoped to a
+different org/app. Re-mint from the dashboard.
+
+**`403 Forbidden` on deploy creation but upload worked.**  The token has
+`image:upload` scope but not `deploy:create`. Talk to your org admin or
+re-issue with the right scope.
+
+**`413 Payload Too Large`.**  Image exceeds the controller's per-app upload
+limit (50 MiB default). Slim the image (multi-stage build, `--squash`,
+prune dev deps) or ask Pomelo to raise the limit for your app.
+
+**`pomelo: command not found` after install.**  The installer fell back to
+`~/.local/bin` because `/usr/local/bin` wasn't writable. Add `~/.local/bin`
+to your `PATH` or re-run with `sudo bash install.sh`.
+
+**Stream cuts out before `deploy.ready`/`deploy.failed`.**  The CLI exits 1
+when this happens — don't trust an empty pipe as success. Most often this is
+a flaky CI runner network; re-run the job. If it's persistent, check the
+controller's `/v1/deploys/{id}` endpoint directly.
+
+**`jq: command not found`.**  Install it: `apt-get install jq` /
+`brew install jq` / `apk add jq`. The installer warns about this at install
+time.
+
+## CI templates
+
+Drop-in starting points lives in [`templates/`](templates/):
+
+- [`github-actions.yml`](templates/github-actions.yml)
+- [`gitlab-ci.yml`](templates/gitlab-ci.yml)
+- [`circleci-config.yml`](templates/circleci-config.yml)
+- [`jenkinsfile-snippet`](templates/jenkinsfile-snippet)
+- [`buildkite-step.yml`](templates/buildkite-step.yml)

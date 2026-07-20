@@ -1,0 +1,35 @@
+// Snippet to insert into a Declarative Jenkinsfile.
+//
+// Credentials (Manage Jenkins → Credentials):
+//   pomelo-url    — Secret text, e.g. https://controller.driver.pomelo.io
+//   pomelo-token  — Secret text, the deploy token (starts with pkd_)
+
+stage('Build image') {
+    steps {
+        sh '''
+            docker build -t my-app:${GIT_COMMIT} .
+            docker save my-app:${GIT_COMMIT} | gzip > image.tar.gz
+        '''
+    }
+}
+
+stage('Deploy to Pomelo') {
+    environment {
+        POMELO_URL   = credentials('pomelo-url')
+        POMELO_TOKEN = credentials('pomelo-token')
+    }
+    steps {
+        sh '''
+            command -v jq >/dev/null || (apt-get update && apt-get install -y --no-install-recommends jq)
+            curl -fsSL https://raw.githubusercontent.com/PomeloProductions/deploy/v1/install.sh \
+              | bash -s -- --to "$WORKSPACE/.pomelo-bin"
+
+            "$WORKSPACE/.pomelo-bin/pomelo" deploy \
+              --url   "$POMELO_URL" \
+              --token "$POMELO_TOKEN" \
+              --org   your-org-slug \
+              --app   your-app-slug \
+              --image ./image.tar.gz
+        '''
+    }
+}

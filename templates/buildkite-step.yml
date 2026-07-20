@@ -1,0 +1,27 @@
+# .buildkite/pipeline.yml
+#
+# Minimal Buildkite pipeline that builds your image and ships it to Pomelo's
+# client-driver controller. Agents must have docker, bash, curl, and jq.
+#
+# Required env vars (Pipeline Settings → Environment Variables, or via the
+# secrets agent hook):
+#   POMELO_URL    — e.g. https://controller.driver.pomelo.io
+#   POMELO_TOKEN  — a deploy token (starts with pkd_)
+
+steps:
+  - label: ":docker: Build & deploy"
+    command: |
+      set -euo pipefail
+      docker build -t my-app:${BUILDKITE_COMMIT} .
+      docker save my-app:${BUILDKITE_COMMIT} | gzip > image.tar.gz
+
+      curl -fsSL https://raw.githubusercontent.com/PomeloProductions/deploy/v1/install.sh \
+        | bash -s -- --to "$$PWD/.pomelo-bin"
+
+      "$$PWD/.pomelo-bin/pomelo" deploy \
+        --url   "$$POMELO_URL" \
+        --token "$$POMELO_TOKEN" \
+        --org   your-org-slug \
+        --app   your-app-slug \
+        --image ./image.tar.gz
+    branches: "main"
