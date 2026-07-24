@@ -28,11 +28,11 @@ inputs:
     description: 'Path to a gzipped OCI image tarball (e.g. ./image.tar.gz)'
     required: true
   env-file:
-    description: 'Optional path to a .env file whose contents become the deploy env Secret'
+    description: '(deprecated, ignored) The upload is async and no longer takes env; manage env via the controller per-service secrets store. Accepted for backward compatibility.'
     required: false
     default: ''
   wait:
-    description: 'Wait for deploy to finish (true) or return immediately after upload (false). Default: true'
+    description: 'Wait for deploy to finish (true) or return immediately after upload (false). The single async upload chains the push + deploy server-side. Default: true'
     required: false
     default: 'true'
   install-ref:
@@ -45,7 +45,7 @@ outputs:
     description: 'The deploy id returned by the controller'
     value: ${{ steps.deploy.outputs.deploy_id }}
   image_ref:
-    description: 'The image ref pushed to the controller'
+    description: 'The image ref pushed to the controller. NOTE: computed server-side by the async push, so it may be empty at upload time — follow the deploy_id for the resolved ref.'
     value: ${{ steps.deploy.outputs.image_ref }}
 
 runs:

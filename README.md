@@ -9,7 +9,8 @@ platform and watches it roll out.
 `apps/deploy/` ships three things that tenants will consume from the outside:
 
 - a thin **bash CLI** (`pomelo deploy …`) that POSTs a gzipped image tarball
-  to the controller, kicks off a deploy, and streams logs back;
+  to the controller (a single async call that returns a deploy id and chains
+  the push + deploy server-side) and streams logs back to completion;
 - a **composite GitHub Action** (`PomeloProductions/deploy@v1`)
   that wraps the CLI in two YAML steps so a tenant workflow is ~6 lines;
 - a small **installer** (`install.sh`) for non-GitHub CIs and laptops.
@@ -200,20 +201,33 @@ pomelo deploy \
   --image ./image.tar.gz
 ```
 
-Pass `--env-file ./deploy.env` to ship environment variables alongside the
-image (they become the app's runtime Secret). Pass `--no-wait` to return
-as soon as the deploy starts instead of streaming logs to completion.
+Pass `--no-wait` to return as soon as the deploy starts instead of streaming
+logs to completion.
+
+> **`--env-file` is deprecated / ignored.** The upload is now asynchronous and
+> no longer accepts env in the request. Manage deploy-time environment through
+> the controller's per-service secrets store (synced on provision). The flag is
+> still accepted (and warns) so old workflows don't break.
 
 ## API reference
 
-The CLI is a wrapper over three HTTP endpoints. If you want to call them
-directly — debugging, alternative tooling, etc. — here's the contract.
+The CLI wraps **two** HTTP endpoints: an asynchronous upload and the log
+stream. If you want to call them directly — debugging, alternative tooling,
+etc. — here's the contract.
 
-Each endpoint has a **service-id** form (preferred) and a **legacy org/app**
-form. They are equivalent except the service form resolves the K8s target from
-the Service record; pick whichever matches how the token was minted.
+The upload endpoint has a **service-id** form (preferred) and a **legacy
+org/app** form. They are equivalent except the service form resolves the K8s
+target from the Service record; pick whichever matches how the token was
+minted.
 
-### 1. Upload an image
+### 1. Upload an image (async — this IS the deploy)
+
+The upload is asynchronous. The endpoint streams the tarball to a shared
+staging volume, hands it to a queued job on the controller's worker (which does
+the skopeo push to GHCR and then **chains the deploy**), and returns **202
+immediately** — before the (potentially minutes-long) push. This avoids the
+load-balancer idle-timeout `504` that a synchronous push hit on fat images.
+There is **no separate "create a deploy" call**.
 
 ```
 # preferred:
@@ -226,13 +240,16 @@ POST /v1/organizations/{organization}/apps/{app}/images
   Content-Encoding: gzip
   body: gzipped OCI image tarball
 
-→ 201 Created
-  { "image_ref": "ghcr.io/pomeloproductions/<repo>:sha-<digest>",
-    "digest":    "sha256:…" }
+→ 202 Accepted
+  { "deploy_id": "dep_01H…", "status": "pending",
+    "logs_url":  "/v1/deploys/dep_01H…/logs" }
 ```
 
 The service form pushes to the Service's configured `image_repository` (or, if
-unset, the global `<base>/<slug>` convention).
+unset, the global `<base>/<slug>` convention). The final `image_ref`
+(`…:sha-<digest>`) is computed server-side and recorded on the deploy; it is
+NOT in the 202 response (the digest isn't known until the worker inspects the
+archive).
 
 ```bash
 curl --fail -X POST \
@@ -243,24 +260,9 @@ curl --fail -X POST \
   "$POMELO_URL/v1/services/42/images"
 ```
 
-### 2. Create a deploy
+### 2. Stream deploy logs
 
-```
-# preferred:
-POST /v1/services/{service}/deploys
-# deprecated:
-POST /v1/organizations/{organization}/apps/{app}/deploys
-
-  Authorization: Bearer pkd_…
-  Content-Type: application/json
-  body: { "image_ref": "…", "env": { "FOO": "bar" } }   # env is optional
-
-→ 202 Accepted
-  { "deploy_id": "dep_01H…", "status": "pending",
-    "logs_url": "/v1/deploys/dep_01H…/logs" }
-```
-
-### 3. Stream deploy logs
+Follow the `deploy_id` from the 202 response over SSE:
 
 ```
 GET /v1/deploys/{deploy_id}/logs
@@ -268,39 +270,46 @@ GET /v1/deploys/{deploy_id}/logs
   Accept: text/event-stream
 
 → SSE stream of events:
-  data: {"event_type":"build.started","message":"…","metadata":{},"created_at":"…"}
-  data: {"event_type":"deploy.ready",  "message":"…","metadata":{},"created_at":"…"}
+  data: {"event_type":"log","message":"Image received; queued for push","metadata":{…}}
+  data: {"event_type":"status_changed","message":"pending → pushing_to_ghcr","metadata":{"new_status":"pushing_to_ghcr"}}
+  …
+  data: {"event_type":"status_changed","message":"rolling_out → ready","metadata":{"new_status":"ready"}}
+  event: done
+  data: {}
 ```
 
-The stream terminates on either `deploy.ready` (success) or `deploy.failed`
-(failure). The CLI exits 0 / 1 to match.
+The deploy advances `pending → pushing_to_ghcr → updating_k8s → rolling_out →
+ready` (or `→ failed`). The stream sends a terminating `event: done` once the
+deploy is terminal. The CLI watches the `status_changed` metadata and exits 0
+on `new_status: ready`, 1 on `failed` (or a torn connection).
 
-> The exact request/response shapes will be locked when the controller API
-> (Tracks A/B) merges. If something diverges, this README and
-> `cli/pomelo-deploy.sh` are the single source of truth — the contract is
-> defined in one place in the CLI and is straightforward to update.
+> This README and `cli/pomelo-deploy.sh` are the single source of truth for the
+> contract — it's defined in one place in the CLI and is straightforward to
+> update.
 
 ## Troubleshooting
 
 **`401 Unauthorized` on upload.**  Token is missing, revoked, or scoped to a
 different org/app. Re-mint from the dashboard.
 
-**`403 Forbidden` on deploy creation but upload worked.**  The token has
-`image:upload` scope but not `deploy:create`. Talk to your org admin or
-re-issue with the right scope.
+**`403 Forbidden` on upload.**  The token lacks the `images:write` scope for
+the target org/service. Talk to your org admin or re-issue with the right
+scope. (The upload now chains the deploy server-side, so a single
+`images:write`-scoped token drives the whole flow.)
 
-**`413 Payload Too Large`.**  Image exceeds the controller's per-app upload
-limit (50 MiB default). Slim the image (multi-stage build, `--squash`,
-prune dev deps) or ask Pomelo to raise the limit for your app.
+**`413 Payload Too Large`.**  Image exceeds the controller's upload limit.
+Slim the image (multi-stage build, prune dev deps) or ask Pomelo to raise the
+limit for your app.
 
 **`pomelo: command not found` after install.**  The installer fell back to
 `~/.local/bin` because `/usr/local/bin` wasn't writable. Add `~/.local/bin`
 to your `PATH` or re-run with `sudo bash install.sh`.
 
-**Stream cuts out before `deploy.ready`/`deploy.failed`.**  The CLI exits 1
-when this happens — don't trust an empty pipe as success. Most often this is
-a flaky CI runner network; re-run the job. If it's persistent, check the
-controller's `/v1/deploys/{id}` endpoint directly.
+**Stream cuts out before the deploy reaches `ready`.**  The CLI exits 1 when
+this happens — it only reports success on an explicit `new_status: ready`, so
+an empty/torn pipe is never treated as success. Most often this is a flaky CI
+runner network; re-run the job. If it's persistent, re-attach to the stream at
+`/v1/deploys/{deploy_id}/logs` — the deploy keeps running server-side.
 
 **`jq: command not found`.**  Install it: `apt-get install jq` /
 `brew install jq` / `apk add jq`. The installer warns about this at install
