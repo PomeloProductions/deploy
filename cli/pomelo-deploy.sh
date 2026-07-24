@@ -60,12 +60,22 @@ FLAGS
     --org        (deprecated) Tenant org slug (e.g. equity-creative)
     --app        (deprecated) App slug within the org (e.g. cnh-merchandising)
     --image      Path to a gzipped OCI image tarball (output of `docker save | gzip`)
-    --env-file   Optional .env-style file; contents become the deploy env Secret
+    --env-file   (ignored) Deprecated. The upload is async and no longer takes
+                 env; manage deploy-time env via the controller's per-service
+                 secrets store instead. Accepted for backward compatibility.
     --no-wait    Return after starting the deploy instead of streaming logs
+
+FLOW
+    The upload endpoint is asynchronous: a single POST to /images stages the
+    tarball, returns 202 with a deploy id, and the server chains the skopeo
+    push then the deploy. The CLI follows that one deploy's SSE log stream to
+    a terminal status. There is no separate deploy call.
 
 OUTPUTS
     Prints `deploy_id=...` and `image_ref=...` to stdout (and to $GITHUB_OUTPUT
-    when running inside a GitHub Actions step).
+    when running inside a GitHub Actions step). NOTE: with the async flow the
+    image_ref is computed server-side (the digest isn't known at upload time),
+    so `image_ref` may be empty in the output.
 
 EXIT
     0  deploy succeeded (or --no-wait was set and the deploy started)
@@ -162,28 +172,6 @@ parse_args() {
 # API calls
 # ---------------------------------------------------------------------------
 
-# Convert a KEY=value .env file into a JSON object. Lines starting with `#`
-# and blank lines are ignored. Values may be quoted with " or '.
-env_file_to_json() {
-    local file="$1"
-    # jq -R reads raw lines; -s slurps to an array; the filter strips comments,
-    # splits on the first `=`, and trims wrapping quotes (double or single).
-    # `--arg sq "'"` gives the filter a literal single-quote it can compare
-    # against without resorting to a jq escape that some versions reject.
-    jq -R -s --arg sq "'" '
-        split("\n")
-        | map(select(length > 0 and (startswith("#") | not)))
-        | map(capture("^(?<k>[A-Za-z_][A-Za-z0-9_]*)=(?<v>.*)$"))
-        | map(.v |= (
-            if (startswith("\"") and endswith("\"")) then .[1:-1]
-            elif (startswith($sq) and endswith($sq)) then .[1:-1]
-            else . end
-          ))
-        | map({(.k): .v})
-        | add // {}
-    ' "$file"
-}
-
 # Build the base path for the target — service-keyed (preferred) or the
 # legacy org/app-slug path.
 target_base() {
@@ -194,14 +182,23 @@ target_base() {
     fi
 }
 
-# Upload the gzipped tarball. Returns 0 on HTTP 2xx; sets IMAGE_REF + DIGEST.
+# Upload the gzipped tarball. The endpoint is ASYNCHRONOUS: it stages the
+# tarball, hands it to a queued job on the worker (which does the skopeo push
+# then chains the deploy), and returns 202 immediately with a deploy id. So a
+# single upload call IS the whole deploy — there is no separate `deploys` call.
+#
+# Returns 0 on HTTP 2xx; sets DEPLOY_ID. (IMAGE_REF is not known until the
+# worker computes the digest, so it's resolved from the logs / left empty.)
 upload_image() {
     local endpoint
     endpoint="$(target_base)/images"
     local response_file http_code
 
     response_file="$(mktemp -t pomelo-upload.XXXXXX)"
-    trap 'rm -f "$response_file"' RETURN
+    # Guard the expansion: a RETURN trap can fire in a caller's scope where
+    # $response_file is no longer set (with `set -u` that would abort), so use
+    # a defaulted expansion.
+    trap 'rm -f "${response_file:-}"' RETURN
 
     info "uploading $IMAGE -> $endpoint"
 
@@ -224,66 +221,34 @@ upload_image() {
         return 1
     fi
 
-    IMAGE_REF="$(jq -r '.image_ref // empty' < "$response_file")"
-    DIGEST="$(jq -r '.digest // empty' < "$response_file")"
-
-    [[ -n "$IMAGE_REF" ]] || { log "no image_ref in upload response"; cat "$response_file" >&2; return 1; }
-    info "uploaded: $IMAGE_REF ${DIGEST:+(digest $DIGEST)}"
-}
-
-# Kick off a deploy referencing the just-uploaded image. Sets DEPLOY_ID.
-create_deploy() {
-    local endpoint
-    endpoint="$(target_base)/deploys"
-    local body env_json="{}"
-
-    if [[ -n "$ENV_FILE" ]]; then
-        env_json="$(env_file_to_json "$ENV_FILE")"
-    fi
-
-    body="$(jq -n \
-        --arg image_ref "$IMAGE_REF" \
-        --argjson env "$env_json" \
-        '{image_ref: $image_ref, env: $env}')"
-
-    info "creating deploy at $endpoint"
-
-    local response_file http_code
-    response_file="$(mktemp -t pomelo-deploy.XXXXXX)"
-    trap 'rm -f "$response_file"' RETURN
-
-    http_code="$(
-        curl --silent --show-error \
-             --write-out '%{http_code}' \
-             --output "$response_file" \
-             --request POST \
-             --header "Authorization: Bearer $TOKEN" \
-             --header "Content-Type: application/json" \
-             --data "$body" \
-             "$endpoint"
-    )"
-
-    if [[ "$http_code" != 2* ]]; then
-        log "create-deploy failed (HTTP $http_code):"
-        cat "$response_file" >&2 || true
-        return 1
-    fi
-
+    # New async contract: the 202 response carries the deploy id the worker
+    # created. The push + deploy happen server-side; we just follow the deploy.
     DEPLOY_ID="$(jq -r '.deploy_id // empty' < "$response_file")"
-    [[ -n "$DEPLOY_ID" ]] || { log "no deploy_id in response"; cat "$response_file" >&2; return 1; }
-    info "deploy started: $DEPLOY_ID"
+    # `image_ref` may be absent (async: not known until the worker digests the
+    # archive). Keep whatever the server returned, for the emitted output.
+    IMAGE_REF="$(jq -r '.image_ref // empty' < "$response_file")"
+
+    [[ -n "$DEPLOY_ID" ]] || { log "no deploy_id in upload response"; cat "$response_file" >&2; return 1; }
+    info "upload accepted; deploy started: $DEPLOY_ID"
 }
 
-# Stream SSE logs until status = ready/failed. Each event line looks like:
-#   data: {"event_type":"build.started","message":"...","metadata":{},"created_at":"..."}
-# Sets STREAM_EXIT to 0 on ready, 1 on failed/timeout.
+# Stream SSE logs until the deploy reaches a terminal status. The controller's
+# wire format (see DeployLogsController) is:
+#   data: {"event_type":"status_changed","message":"pending → ready",
+#          "metadata":{"previous_status":"...","new_status":"ready"},...}\n\n
+# and it sends a terminating `event: done\ndata: {}\n\n` once the deploy is
+# terminal (ready / failed).
+#
+# We short-circuit on the status_changed event whose new_status is ready/failed
+# (definitive), and treat a lone `event: done` as a clean end too. Returns 0 on
+# ready, 1 on failed / torn connection.
 stream_logs() {
     local endpoint="$URL/$API_VERSION/deploys/$DEPLOY_ID/logs"
     info "streaming logs from $endpoint"
 
     # `curl -N` disables buffering so SSE lines arrive as the server emits them.
-    # We pipe through a small awk that pretty-prints each event and short-circuits
-    # when we see a terminal status.
+    # We pipe through a small awk that pretty-prints each data event and
+    # short-circuits when it sees a terminal new_status.
     set +e
     curl --silent --show-error -N \
          --header "Authorization: Bearer $TOKEN" \
@@ -294,10 +259,11 @@ stream_logs() {
             sub(/^data:[[:space:]]*/, "")
             print
             fflush()
-            # The controller emits {"event_type":"deploy.ready"} / "deploy.failed"
-            # as the terminal event; matching on the substring is enough.
-            if (index($0, "\"deploy.ready\"")  > 0) { print "__POMELO_STATUS__=ready";  exit 0 }
-            if (index($0, "\"deploy.failed\"") > 0) { print "__POMELO_STATUS__=failed"; exit 2 }
+            # Terminal status is carried in the status_changed metadata.
+            # `"new_status":"ready"` / `"failed"` is definitive; match on the
+            # substring (tolerant of surrounding whitespace variants).
+            if ($0 ~ /"new_status"[[:space:]]*:[[:space:]]*"ready"/)  { print "__POMELO_STATUS__=ready";  exit 0 }
+            if ($0 ~ /"new_status"[[:space:]]*:[[:space:]]*"failed"/) { print "__POMELO_STATUS__=failed"; exit 2 }
         }
     ' | tee /tmp/pomelo-stream.$$
     local rc=${PIPESTATUS[1]}
@@ -307,15 +273,21 @@ stream_logs() {
         rm -f /tmp/pomelo-stream.$$
         return 1
     fi
-
+    local sawReady=0
+    grep -q '^__POMELO_STATUS__=ready' /tmp/pomelo-stream.$$ 2>/dev/null && sawReady=1
     rm -f /tmp/pomelo-stream.$$
 
-    # awk exits 0 on EOF too (server hung up without a terminal event). Treat that
-    # as ambiguous → failure, so CI doesn't go green on a torn connection.
-    if [[ "$rc" -ne 0 ]]; then
-        log "log stream ended without a terminal status (exit $rc)"
-        return 1
+    # If awk saw an explicit ready, we're done.
+    if [[ "$sawReady" -eq 1 ]]; then
+        return 0
     fi
+
+    # Otherwise the stream ended on `event: done` (EOF, rc 0) without our awk
+    # catching a terminal new_status. That's ambiguous — the server closed the
+    # stream but we didn't positively observe `ready`. Treat as failure so CI
+    # doesn't go green on a torn or truncated connection.
+    log "log stream ended without a positive 'ready' status (exit $rc)"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -327,8 +299,16 @@ main() {
     require_cmd curl
     require_cmd jq
 
+    # The upload endpoint is asynchronous: one POST to /images stages the
+    # tarball, and the server chains push -> deploy. There is no longer a
+    # separate /deploys call from the CLI.
+    if [[ -n "$ENV_FILE" ]]; then
+        log "warning: --env-file is ignored by the async upload flow. Manage"
+        log "         deploy-time env via the controller's per-service secrets"
+        log "         store (synced on provision), not the upload call."
+    fi
+
     upload_image
-    create_deploy
 
     emit_output "image_ref" "$IMAGE_REF"
     emit_output "deploy_id" "$DEPLOY_ID"
