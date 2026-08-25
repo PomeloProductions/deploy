@@ -279,9 +279,21 @@ GET /v1/deploys/{deploy_id}/logs
 ```
 
 The deploy advances `pending → pushing_to_ghcr → updating_k8s → rolling_out →
-ready` (or `→ failed`). The stream sends a terminating `event: done` once the
-deploy is terminal. The CLI watches the `status_changed` metadata and exits 0
-on `new_status: ready`, 1 on `failed` (or a torn connection).
+ready` (or `→ failed`; or `→ available` for a gated build awaiting promotion).
+The stream sends a terminating `event: done` once the deploy is terminal. The
+CLI watches the `status_changed` metadata and exits 0 on `new_status: ready`,
+1 on `failed` or `available`.
+
+A single SSE connection is **not** authoritative for the outcome: a slow
+rollout can outlive the connection (network blip, proxy idle-timeout, or the
+CLI's own per-connect `--max-time`), and the server may send `event: done`
+before the CLI observed a terminal status. On any non-terminal end the CLI
+**reconnects and resumes** — the controller replays the full event history on
+reconnect, so the terminal transition can't be missed. The CLI only reports
+failure on a real `failed`/`available` status or after exhausting the total
+wait budget (`POMELO_POLL_TIMEOUT`, default 900s). This is why a genuinely slow
+deploy that reaches `ready` now reports success instead of false-failing on a
+torn stream.
 
 > This README and `cli/pomelo-deploy.sh` are the single source of truth for the
 > contract — it's defined in one place in the CLI and is straightforward to
@@ -305,11 +317,18 @@ limit for your app.
 `~/.local/bin` because `/usr/local/bin` wasn't writable. Add `~/.local/bin`
 to your `PATH` or re-run with `sudo bash install.sh`.
 
-**Stream cuts out before the deploy reaches `ready`.**  The CLI exits 1 when
-this happens — it only reports success on an explicit `new_status: ready`, so
-an empty/torn pipe is never treated as success. Most often this is a flaky CI
-runner network; re-run the job. If it's persistent, re-attach to the stream at
-`/v1/deploys/{deploy_id}/logs` — the deploy keeps running server-side.
+**Stream cuts out before the deploy reaches `ready`.**  The CLI does **not**
+fail on this — it reconnects and resumes (the controller replays full history),
+and keeps waiting up to `POMELO_POLL_TIMEOUT` (default 900s) for a terminal
+status. It reports success only on an explicit `new_status: ready`, and failure
+only on `failed`/`available` or on exhausting that budget. If a healthy rollout
+is legitimately slower than the budget, raise `POMELO_POLL_TIMEOUT`; the deploy
+keeps running server-side regardless and can be re-attached at
+`/v1/deploys/{deploy_id}/logs`.
+
+Tuning knobs (env vars): `POMELO_POLL_TIMEOUT` (total wait, default 900s),
+`POMELO_CONNECT_TIMEOUT` (per-connect `curl --max-time`, default 120s),
+`POMELO_RECONNECT_DELAY` (delay between reconnects, default 2s).
 
 **`jq: command not found`.**  Install it: `apt-get install jq` /
 `brew install jq` / `apk add jq`. The installer warns about this at install

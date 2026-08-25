@@ -78,8 +78,20 @@ OUTPUTS
     so `image_ref` may be empty in the output.
 
 EXIT
-    0  deploy succeeded (or --no-wait was set and the deploy started)
-    1  any failure (auth, upload, build, deploy timeout, etc.)
+    0  deploy succeeded (reached `ready`), or --no-wait was set and it started
+    1  any failure: auth/upload/build error, deploy `failed`, a gated
+       `available` status awaiting promotion, or the wait exceeded
+       POMELO_POLL_TIMEOUT before a terminal status
+
+ENVIRONMENT (log-streaming wait tuning)
+    POMELO_POLL_TIMEOUT     Total seconds to wait for a terminal status across
+                            reconnects (default 900). A slow rollout that stays
+                            healthy still reaches `ready` within this budget.
+    POMELO_CONNECT_TIMEOUT  Per-connect curl --max-time in seconds (default 120,
+                            kept below POMELO_POLL_TIMEOUT). A hung socket trips
+                            this and we reconnect + resume (the controller
+                            replays full history), instead of giving up.
+    POMELO_RECONNECT_DELAY  Seconds to wait between reconnect attempts (default 2).
 EOF
 }
 
@@ -232,6 +244,22 @@ upload_image() {
     info "upload accepted; deploy started: $DEPLOY_ID"
 }
 
+# How long (seconds) a single SSE connect may run before curl tears it down and
+# we reconnect. Kept BELOW the total deadline so a hung/half-open socket becomes
+# a reconnect, not a give-up. The controller replays full history on reconnect,
+# so a fresh connect re-observes every status we may have missed.
+POMELO_CONNECT_TIMEOUT="${POMELO_CONNECT_TIMEOUT:-120}"
+
+# Total wall-clock budget for the whole wait, across reconnects. Must comfortably
+# exceed the controller's rollout budget (~600s) so a genuinely slow-but-healthy
+# rollout still reaches `ready` before we give up. Only exceeding THIS returns a
+# timeout failure.
+POMELO_POLL_TIMEOUT="${POMELO_POLL_TIMEOUT:-900}"
+
+# Delay between reconnect attempts, so a truly-down controller doesn't get
+# hammered in a tight loop.
+POMELO_RECONNECT_DELAY="${POMELO_RECONNECT_DELAY:-2}"
+
 # Stream SSE logs until the deploy reaches a terminal status. The controller's
 # wire format (see DeployLogsController) is:
 #   data: {"event_type":"status_changed","message":"pending → ready",
@@ -239,55 +267,161 @@ upload_image() {
 # and it sends a terminating `event: done\ndata: {}\n\n` once the deploy is
 # terminal (ready / failed).
 #
-# We short-circuit on the status_changed event whose new_status is ready/failed
-# (definitive), and treat a lone `event: done` as a clean end too. Returns 0 on
-# ready, 1 on failed / torn connection.
+# The deploy advances pending → pushing_to_ghcr → updating_k8s → rolling_out →
+# ready (or → failed; or → available for a gated build awaiting promotion).
+#
+# ROBUSTNESS: a single SSE connection is NOT authoritative for the deploy's
+# outcome. A slow rollout can outlive a connection: the stream may tear (network
+# blip, proxy idle-timeout, our own per-connect --max-time) or the server may
+# close it with `event: done` before we caught a terminal new_status. On any
+# such non-terminal end we RECONNECT and RESUME — the controller replays the
+# full event history from the start, so we can't miss the terminal transition.
+# We only ever return non-zero on a real `failed`/`available` status, or on
+# blowing the total deadline. This is the fix for the "false-fail on slow
+# deploy" bug where a torn stream was reported as failure even though the
+# controller reached `ready`.
+#
+# Returns: 0 on ready, 1 on failed / available / timeout.
 stream_logs() {
     local endpoint="$URL/$API_VERSION/deploys/$DEPLOY_ID/logs"
     info "streaming logs from $endpoint"
+    info "wait budget: ${POMELO_POLL_TIMEOUT}s total, ${POMELO_CONNECT_TIMEOUT}s per connect"
 
-    # `curl -N` disables buffering so SSE lines arrive as the server emits them.
-    # We pipe through a small awk that pretty-prints each data event and
-    # short-circuits when it sees a terminal new_status.
-    set +e
-    curl --silent --show-error -N \
-         --header "Authorization: Bearer $TOKEN" \
-         --header "Accept: text/event-stream" \
-         "$endpoint" \
-    | awk -v RS='\n' '
-        /^data:/ {
-            sub(/^data:[[:space:]]*/, "")
-            print
-            fflush()
-            # Terminal status is carried in the status_changed metadata.
-            # `"new_status":"ready"` / `"failed"` is definitive; match on the
-            # substring (tolerant of surrounding whitespace variants).
-            if ($0 ~ /"new_status"[[:space:]]*:[[:space:]]*"ready"/)  { print "__POMELO_STATUS__=ready";  exit 0 }
-            if ($0 ~ /"new_status"[[:space:]]*:[[:space:]]*"failed"/) { print "__POMELO_STATUS__=failed"; exit 2 }
-        }
-    ' | tee /tmp/pomelo-stream.$$
-    local rc=${PIPESTATUS[1]}
-    set -e
+    local start_ts now elapsed remaining
+    start_ts="$(date +%s)"
 
-    if grep -q '^__POMELO_STATUS__=failed' /tmp/pomelo-stream.$$ 2>/dev/null; then
-        rm -f /tmp/pomelo-stream.$$
-        return 1
-    fi
-    local sawReady=0
-    grep -q '^__POMELO_STATUS__=ready' /tmp/pomelo-stream.$$ 2>/dev/null && sawReady=1
-    rm -f /tmp/pomelo-stream.$$
+    # Track the last status we already printed so replayed history on reconnect
+    # doesn't spam the log with duplicate transitions.
+    local last_status=""
+    local attempt=0
 
-    # If awk saw an explicit ready, we're done.
-    if [[ "$sawReady" -eq 1 ]]; then
-        return 0
-    fi
+    local stream_file status_file
+    stream_file="$(mktemp -t pomelo-stream.XXXXXX)"
+    status_file="$(mktemp -t pomelo-status.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -f '$stream_file' '$status_file'" RETURN
 
-    # Otherwise the stream ended on `event: done` (EOF, rc 0) without our awk
-    # catching a terminal new_status. That's ambiguous — the server closed the
-    # stream but we didn't positively observe `ready`. Treat as failure so CI
-    # doesn't go green on a torn or truncated connection.
-    log "log stream ended without a positive 'ready' status (exit $rc)"
-    return 1
+    while :; do
+        now="$(date +%s)"
+        elapsed=$(( now - start_ts ))
+        remaining=$(( POMELO_POLL_TIMEOUT - elapsed ))
+        if [[ "$remaining" -le 0 ]]; then
+            log "deploy did not reach a terminal status within ${POMELO_POLL_TIMEOUT}s"
+            log "the deploy keeps running server-side; re-attach at $endpoint"
+            return 1
+        fi
+
+        # Cap this connect at the smaller of the per-connect ceiling and whatever
+        # remains of the total budget, so we never overshoot the deadline waiting
+        # on one socket.
+        local connect_max="$POMELO_CONNECT_TIMEOUT"
+        [[ "$remaining" -lt "$connect_max" ]] && connect_max="$remaining"
+
+        attempt=$(( attempt + 1 ))
+        [[ "$attempt" -gt 1 ]] && info "reconnecting to log stream (attempt $attempt, ${remaining}s of budget left)"
+
+        : > "$status_file"
+
+        # `curl -N` disables buffering so SSE lines arrive as the server emits
+        # them. --max-time bounds this single connect. We pipe through awk that
+        # pretty-prints each new event and records a terminal new_status. awk
+        # gets the last status we already printed so it can suppress replayed
+        # lines up to and including it on a reconnect.
+        #
+        # A non-zero curl (torn stream / --max-time) is expected and handled, so
+        # disable errexit around the pipe — saving the caller's setting so we
+        # restore it exactly, rather than force it on.
+        local _errexit_was_set=0
+        [[ $- == *e* ]] && _errexit_was_set=1
+        set +e
+        curl --silent --show-error -N \
+             --max-time "$connect_max" \
+             --header "Authorization: Bearer $TOKEN" \
+             --header "Accept: text/event-stream" \
+             "$endpoint" \
+        | awk -v RS='\n' -v last="$last_status" -v statusfile="$status_file" '
+            function status_of(line,   s) {
+                if (match(line, /"new_status"[[:space:]]*:[[:space:]]*"[^"]+"/)) {
+                    s = substr(line, RSTART, RLENGTH)
+                    sub(/^"new_status"[[:space:]]*:[[:space:]]*"/, "", s)
+                    sub(/"$/, "", s)
+                    return s
+                }
+                return ""
+            }
+            BEGIN { seen_last = (last == "") ? 1 : 0 }
+            /^data:/ {
+                sub(/^data:[[:space:]]*/, "")
+                cur = status_of($0)
+
+                # Suppress replayed history: skip lines until we pass the last
+                # status we had already printed on a previous connect.
+                if (!seen_last) {
+                    if (cur != "" && cur == last) { seen_last = 1 }
+                    next
+                }
+
+                print
+                fflush()
+
+                if (cur != "") {
+                    # Record the newest status so the parent can resume cleanly.
+                    print cur > statusfile
+                    fflush(statusfile)
+                    # Terminal statuses end this awk (and the connect) with a
+                    # DISTINCT non-zero code each. Crucially we do NOT use exit 0
+                    # for ready: a clean EOF with no data (torn/idle stream) also
+                    # yields awk exit 0, and that must NOT be read as success.
+                    if (cur == "ready")     { exit 10 }
+                    if (cur == "failed")    { exit 11 }
+                    if (cur == "available") { exit 12 }
+                }
+            }
+        ' | tee "$stream_file"
+        local awk_rc=${PIPESTATUS[1]}
+        [[ "$_errexit_was_set" -eq 1 ]] && set -e
+
+        # Adopt the newest status this connect observed, so a reconnect resumes
+        # from the right point in the replayed history.
+        if [[ -s "$status_file" ]]; then
+            last_status="$(tail -n1 "$status_file")"
+        fi
+
+        case "$awk_rc" in
+            10)
+                info "deploy reached status: ready"
+                return 0
+                ;;
+            11)
+                log "deploy failed"
+                # Surface the controller's error message if the failing event
+                # carried one in metadata.error.
+                local err
+                err="$(grep -o '"error"[[:space:]]*:[[:space:]]*"[^"]*"' "$stream_file" | tail -n1 | sed 's/.*:[[:space:]]*"//; s/"$//')"
+                [[ -n "$err" ]] && log "controller error: $err"
+                return 1
+                ;;
+            12)
+                log "deploy reached status: available (gated build)"
+                log "the image was pushed but is NOT live — it is awaiting promotion."
+                log "promote it from the dashboard (or via the controller's promote"
+                log "endpoint) to roll it out. Not treating this as a successful deploy."
+                return 1
+                ;;
+            *)
+                # Non-terminal end: torn stream, curl --max-time hit, or a lone
+                # `event: done` before we saw a terminal new_status. Reconnect
+                # and resume rather than falsely reporting failure — the slow
+                # rollout is very likely still progressing server-side.
+                if [[ -n "$last_status" ]]; then
+                    info "stream ended at status '$last_status' before terminal (curl rc via --max-time or torn/done); reconnecting"
+                else
+                    info "stream ended before any status (torn/done); reconnecting"
+                fi
+                sleep "$POMELO_RECONNECT_DELAY"
+                ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -320,6 +454,11 @@ main() {
 
     stream_logs
     info "deploy ready"
+    exit 0
 }
 
-main "$@"
+# Only run main when executed directly, not when sourced by the test harness
+# (tests source this file to exercise stream_logs against a mocked curl).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
