@@ -164,6 +164,68 @@ else
     printf 'FAIL - available missing promote guidance\n'; FAIL=$(( FAIL + 1 ))
 fi
 
+# --- Scenario 6: snapshot-on-connect, already ready -------------------------
+# Reproduces the live bug: the client connects AFTER the deploy finished. The
+# controller's first frame is a status snapshot (metadata.snapshot:true) with
+# new_status: ready, followed by history + done. The CLI must exit 0 on the
+# snapshot without looping.
+reset_mock
+{
+    sse '{"event_type":"status_changed","message":"current status: ready","metadata":{"new_status":"ready","snapshot":true}}'
+    sse '{"event_type":"status_changed","metadata":{"new_status":"pushing_to_ghcr"}}'
+    sse '{"event_type":"status_changed","metadata":{"new_status":"ready"}}'
+    printf 'event: done\ndata: {}\n\n'
+} > "$MOCK_DIR/connect_1.sse"
+POMELO_POLL_TIMEOUT=60 stream_logs >/dev/null 2>&1
+assert_rc 0 $? "snapshot-ready-on-connect"
+
+# --- Scenario 7: snapshot-on-connect, already failed ------------------------
+reset_mock
+{
+    sse '{"event_type":"status_changed","message":"current status: failed","metadata":{"new_status":"failed","snapshot":true}}'
+    printf 'event: done\ndata: {}\n\n'
+} > "$MOCK_DIR/connect_1.sse"
+POMELO_POLL_TIMEOUT=60 stream_logs >/dev/null 2>&1
+assert_rc 1 $? "snapshot-failed-on-connect"
+
+# --- Scenario 8: non-terminal snapshot then live rollout to ready -----------
+# A snapshot with a non-terminal status (rolling_out) must NOT be printed as a
+# duplicate line and must NOT terminate; the live transition to ready ends it.
+reset_mock
+{
+    sse '{"event_type":"status_changed","message":"current status: rolling_out","metadata":{"new_status":"rolling_out","snapshot":true}}'
+    sse '{"event_type":"status_changed","metadata":{"new_status":"rolling_out"}}'
+    sse '{"event_type":"status_changed","metadata":{"new_status":"ready"}}'
+    printf 'event: done\ndata: {}\n\n'
+} > "$MOCK_DIR/connect_1.sse"
+out="$(POMELO_POLL_TIMEOUT=60 stream_logs 2>&1)"; rc=$?
+assert_rc 0 "$rc" "non-terminal-snapshot-then-ready"
+# The snapshot line ("current status: rolling_out") must not be echoed.
+if grep -q 'current status: rolling_out' <<<"$out"; then
+    printf 'FAIL - non-terminal snapshot leaked to output\n'; FAIL=$(( FAIL + 1 ))
+else
+    printf 'ok   - non-terminal snapshot is swallowed\n'; PASS=$(( PASS + 1 ))
+fi
+
+# --- Scenario 9: torn mid-rollout, reconnect snapshot is terminal -----------
+# Connect #1 progresses then tears. Connect #2's snapshot reports ready (the
+# deploy finished during the gap). The CLI must exit 0 on the reconnect
+# snapshot even though last_status was rolling_out (suppression must not eat it).
+reset_mock
+{
+    printf '__EXIT__ 28\n'
+    sse '{"event_type":"status_changed","message":"current status: rolling_out","metadata":{"new_status":"rolling_out","snapshot":true}}'
+    sse '{"event_type":"status_changed","metadata":{"new_status":"rolling_out"}}'
+} > "$MOCK_DIR/connect_1.sse"
+{
+    sse '{"event_type":"status_changed","message":"current status: ready","metadata":{"new_status":"ready","snapshot":true}}'
+    sse '{"event_type":"status_changed","metadata":{"new_status":"rolling_out"}}'
+    sse '{"event_type":"status_changed","metadata":{"new_status":"ready"}}'
+    printf 'event: done\ndata: {}\n\n'
+} > "$MOCK_DIR/connect_2.sse"
+POMELO_POLL_TIMEOUT=60 stream_logs >/dev/null 2>&1
+assert_rc 0 $? "reconnect-snapshot-terminal"
+
 # --- Scenario 5: timeout ----------------------------------------------------
 reset_mock
 # Every connect returns 28 with no fixture (mock default) -> never terminal.

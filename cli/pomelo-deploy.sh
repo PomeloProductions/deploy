@@ -265,7 +265,16 @@ POMELO_RECONNECT_DELAY="${POMELO_RECONNECT_DELAY:-2}"
 #   data: {"event_type":"status_changed","message":"pending → ready",
 #          "metadata":{"previous_status":"...","new_status":"ready"},...}\n\n
 # and it sends a terminating `event: done\ndata: {}\n\n` once the deploy is
-# terminal (ready / failed).
+# terminal (ready / failed / available).
+#
+# SNAPSHOT-ON-CONNECT: the controller now emits, as the FIRST data frame on
+# every (re)connect, a synthetic `status_changed` carrying the deploy's CURRENT
+# status and `metadata.snapshot:true`. So a client that attaches AFTER the
+# deploy already finished learns the terminal status immediately — it no longer
+# depends on catching the one-shot live transition or on the historical replay
+# surviving proxy buffering. This is the server side of the fix for the
+# "reports failure even when the deploy succeeded" bug: previously a late
+# connect saw only `event: done` with no status and looped until timeout.
 #
 # The deploy advances pending → pushing_to_ghcr → updating_k8s → rolling_out →
 # ready (or → failed; or → available for a gated build awaiting promotion).
@@ -275,11 +284,9 @@ POMELO_RECONNECT_DELAY="${POMELO_RECONNECT_DELAY:-2}"
 # blip, proxy idle-timeout, our own per-connect --max-time) or the server may
 # close it with `event: done` before we caught a terminal new_status. On any
 # such non-terminal end we RECONNECT and RESUME — the controller replays the
-# full event history from the start, so we can't miss the terminal transition.
-# We only ever return non-zero on a real `failed`/`available` status, or on
-# blowing the total deadline. This is the fix for the "false-fail on slow
-# deploy" bug where a torn stream was reported as failure even though the
-# controller reached `ready`.
+# full event history (and re-emits the snapshot) from the start, so we can't
+# miss the terminal transition. We only ever return non-zero on a real
+# `failed`/`available` status, or on blowing the total deadline.
 #
 # Returns: 0 on ready, 1 on failed / available / timeout.
 stream_logs() {
@@ -349,10 +356,45 @@ stream_logs() {
                 }
                 return ""
             }
+            function is_snapshot(line) {
+                # The controller marks the connect-time status snapshot with
+                # metadata.snapshot:true. It is authoritative for the CURRENT
+                # status and always arrives first, so it must bypass the
+                # replay-suppression gate below.
+                return (line ~ /"snapshot"[[:space:]]*:[[:space:]]*true/)
+            }
+            function act_on(cur) {
+                # Record the newest status so the parent can resume cleanly.
+                print cur > statusfile
+                fflush(statusfile)
+                # Terminal statuses end this awk (and the connect) with a
+                # DISTINCT non-zero code each. Crucially we do NOT use exit 0
+                # for ready: a clean EOF with no data (torn/idle stream) also
+                # yields awk exit 0, and that must NOT be read as success.
+                if (cur == "ready")     { exit 10 }
+                if (cur == "failed")    { exit 11 }
+                if (cur == "available") { exit 12 }
+            }
             BEGIN { seen_last = (last == "") ? 1 : 0 }
             /^data:/ {
                 sub(/^data:[[:space:]]*/, "")
                 cur = status_of($0)
+                snap = is_snapshot($0)
+
+                # The snapshot is the authoritative current status and always
+                # comes first. Act on it immediately — even during suppression —
+                # so an already-terminal deploy exits on the first frame instead
+                # of looping until timeout. A non-terminal snapshot is swallowed
+                # (not printed) to avoid a noisy "current status: rolling_out"
+                # line on every reconnect; the real transitions still print.
+                if (snap) {
+                    if (cur != "" && (cur == "ready" || cur == "failed" || cur == "available")) {
+                        print
+                        fflush()
+                        act_on(cur)
+                    }
+                    next
+                }
 
                 # Suppress replayed history: skip lines until we pass the last
                 # status we had already printed on a previous connect.
@@ -364,18 +406,7 @@ stream_logs() {
                 print
                 fflush()
 
-                if (cur != "") {
-                    # Record the newest status so the parent can resume cleanly.
-                    print cur > statusfile
-                    fflush(statusfile)
-                    # Terminal statuses end this awk (and the connect) with a
-                    # DISTINCT non-zero code each. Crucially we do NOT use exit 0
-                    # for ready: a clean EOF with no data (torn/idle stream) also
-                    # yields awk exit 0, and that must NOT be read as success.
-                    if (cur == "ready")     { exit 10 }
-                    if (cur == "failed")    { exit 11 }
-                    if (cur == "available") { exit 12 }
-                }
+                if (cur != "") { act_on(cur) }
             }
         ' | tee "$stream_file"
         local awk_rc=${PIPESTATUS[1]}
