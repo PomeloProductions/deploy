@@ -10,7 +10,8 @@ platform and watches it roll out.
 
 - a thin **bash CLI** (`pomelo deploy …`) that POSTs a gzipped image tarball
   to the controller (a single async call that returns a deploy id and chains
-  the push + deploy server-side) and streams logs back to completion;
+  the push + deploy server-side), then **polls the deploy's status** to a
+  terminal outcome while showing logs best-effort;
 - a **composite GitHub Action** (`PomeloProductions/deploy@v1`)
   that wraps the CLI in two YAML steps so a tenant workflow is ~6 lines;
 - a small **installer** (`install.sh`) for non-GitHub CIs and laptops.
@@ -211,9 +212,9 @@ logs to completion.
 
 ## API reference
 
-The CLI wraps **two** HTTP endpoints: an asynchronous upload and the log
-stream. If you want to call them directly — debugging, alternative tooling,
-etc. — here's the contract.
+The CLI wraps **two** HTTP endpoints: an asynchronous upload, and the deploy
+logs/status SSE stream (which it polls for the current status). If you want to
+call them directly — debugging, alternative tooling, etc. — here's the contract.
 
 The upload endpoint has a **service-id** form (preferred) and a **legacy
 org/app** form. They are equivalent except the service form resolves the K8s
@@ -260,19 +261,19 @@ curl --fail -X POST \
   "$POMELO_URL/v1/services/42/images"
 ```
 
-### 2. Stream deploy logs
+### 2. Wait for the outcome — poll the deploy's STATUS (source of truth)
 
-Follow the `deploy_id` from the 202 response over SSE:
+Follow the `deploy_id` from the 202 response over the same SSE endpoint:
 
 ```
 GET /v1/deploys/{deploy_id}/logs
   Authorization: Bearer pkd_…
   Accept: text/event-stream
 
-→ SSE stream of events:
+→ SSE stream. The FIRST data frame on every connect is a connect-time status
+  snapshot carrying the deploy's CURRENT status, then history + live events:
+  data: {"event_type":"status_changed","message":"current status: rolling_out","metadata":{"new_status":"rolling_out","snapshot":true}}
   data: {"event_type":"log","message":"Image received; queued for push","metadata":{…}}
-  data: {"event_type":"status_changed","message":"pending → pushing_to_ghcr","metadata":{"new_status":"pushing_to_ghcr"}}
-  …
   data: {"event_type":"status_changed","message":"rolling_out → ready","metadata":{"new_status":"ready"}}
   event: done
   data: {}
@@ -280,20 +281,30 @@ GET /v1/deploys/{deploy_id}/logs
 
 The deploy advances `pending → pushing_to_ghcr → updating_k8s → rolling_out →
 ready` (or `→ failed`; or `→ available` for a gated build awaiting promotion).
-The stream sends a terminating `event: done` once the deploy is terminal. The
-CLI watches the `status_changed` metadata and exits 0 on `new_status: ready`,
-1 on `failed` or `available`.
+The terminal set is `ready` (success), `failed` and `available` (both non-zero).
 
-A single SSE connection is **not** authoritative for the outcome: a slow
-rollout can outlive the connection (network blip, proxy idle-timeout, or the
-CLI's own per-connect `--max-time`), and the server may send `event: done`
-before the CLI observed a terminal status. On any non-terminal end the CLI
-**reconnects and resumes** — the controller replays the full event history on
-reconnect, so the terminal transition can't be missed. The CLI only reports
-failure on a real `failed`/`available` status or after exhausting the total
-wait budget (`POMELO_POLL_TIMEOUT`, default 900s). This is why a genuinely slow
-deploy that reaches `ready` now reports success instead of false-failing on a
-torn stream.
+**How the CLI decides the outcome: it polls the status, it does NOT trust the
+log stream.** Every time the controller accepts a connection on this endpoint it
+emits, as the very first flushed frame, a synthetic `status_changed` snapshot
+(`metadata.new_status`, `metadata.snapshot:true`) carrying the deploy's current
+status — served with `X-Accel-Buffering: no`. The CLI therefore treats a *short*
+connect as a status probe: connect, read that one authoritative frame, close. It
+repeats this every `POMELO_POLL_INTERVAL` seconds and **exits 0 the moment a
+probe reports `ready`**, non-zero on `failed`/`available`, and only times out
+(non-zero) if the status is still non-terminal after `POMELO_POLL_TIMEOUT`.
+
+> There is a dedicated JSON status endpoint, `GET /v1/deploys/{deploy_id}`, but
+> it is **JWT-only** — it rejects the `pkd_…` deploy token the CLI holds. So the
+> snapshot-bearing logs endpoint is the only status channel a deploy token can
+> read, and the short-probe pattern above turns it into an effective status poll.
+
+The log stream is otherwise shown **best-effort only**: a separate long-lived
+connection tails the events for visibility and reconnects if it drops, but its
+health never affects the exit code. This is the fix for the long-standing
+"successful deploy reports red" bug — previously the outcome was read off a
+single long-lived stream, so a stream that stalled, was proxy-buffered, or hit
+an idle timeout ran out the clock and failed the run even though the rollout had
+reached `ready`. Now only the deploy's actual status can fail (or pass) the run.
 
 > This README and `cli/pomelo-deploy.sh` are the single source of truth for the
 > contract — it's defined in one place in the CLI and is straightforward to
@@ -317,18 +328,21 @@ limit for your app.
 `~/.local/bin` because `/usr/local/bin` wasn't writable. Add `~/.local/bin`
 to your `PATH` or re-run with `sudo bash install.sh`.
 
-**Stream cuts out before the deploy reaches `ready`.**  The CLI does **not**
-fail on this — it reconnects and resumes (the controller replays full history),
-and keeps waiting up to `POMELO_POLL_TIMEOUT` (default 900s) for a terminal
-status. It reports success only on an explicit `new_status: ready`, and failure
-only on `failed`/`available` or on exhausting that budget. If a healthy rollout
-is legitimately slower than the budget, raise `POMELO_POLL_TIMEOUT`; the deploy
-keeps running server-side regardless and can be re-attached at
-`/v1/deploys/{deploy_id}/logs`.
+**Live logs cut out / the stream stalls before the deploy reaches `ready`.**
+This does **not** fail the run. The outcome is decided by polling the deploy's
+status, not by the log stream, so a dropped/stalled/buffered stream only means
+fewer logs on screen — the status poll still observes `ready` and exits 0. The
+CLI keeps polling up to `POMELO_POLL_TIMEOUT` (default 900s) and reports failure
+only on an explicit `failed`/`available` status or on exhausting that budget. If
+a healthy rollout is legitimately slower than the budget, raise
+`POMELO_POLL_TIMEOUT`; the deploy keeps running server-side regardless and can be
+re-attached at `/v1/deploys/{deploy_id}/logs`.
 
 Tuning knobs (env vars): `POMELO_POLL_TIMEOUT` (total wait, default 900s),
+`POMELO_POLL_INTERVAL` (seconds between status polls, default 3s),
 `POMELO_CONNECT_TIMEOUT` (per-connect `curl --max-time`, default 120s),
-`POMELO_RECONNECT_DELAY` (delay between reconnects, default 2s).
+`POMELO_RECONNECT_DELAY` (delay between live-log reconnects, default 2s),
+`POMELO_LIVE_LOGS` (set `0` to poll silently without the live log tail).
 
 **`jq: command not found`.**  Install it: `apt-get install jq` /
 `brew install jq` / `apk add jq`. The installer warns about this at install
